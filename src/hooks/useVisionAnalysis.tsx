@@ -1,5 +1,5 @@
 // hooks/useVisionAnalysis.ts
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 
 interface VisionAnalysis {
   id: string;
@@ -24,26 +24,37 @@ export function useVisionAnalysis(): UseVisionAnalysisReturn {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Cleanup thumbnails on unmount to prevent memory leaks
+  useEffect(() => {
+    return () => {
+      analyses.forEach((a) => URL.revokeObjectURL(a.thumbnail));
+    };
+  }, [analyses]);
+
   const analyzeFile = useCallback(
     async (file: File, profession?: string, context?: string): Promise<VisionAnalysis | null> => {
+      // Optional: Add reasonable file size limit (~12MB original file → ~16MB base64)
+      if (file.size > 15 * 1024 * 1024) {
+        setError('File too large. Please upload files under 15MB.');
+        return null;
+      }
+
       setIsAnalyzing(true);
       setError(null);
 
-      try {
+      let thumbnail: string | null = null;
 
+      try {
         const base64 = await new Promise<string>((resolve, reject) => {
           const reader = new FileReader();
-          reader.onload = () => {
-            const result = reader.result as string;
-            resolve(result.split(',')[1]);
-          };
+          reader.onload = () => resolve((reader.result as string).split(',')[1]);
           reader.onerror = reject;
           reader.readAsDataURL(file);
         });
 
-        const thumbnail = URL.createObjectURL(file);
+        thumbnail = URL.createObjectURL(file);
 
-        const basePrompt = `You are a highly skilled AI vision analyst${profession ? ` specializing in ${profession}` : ''}.
+        const prompt = `You are a highly skilled AI vision analyst${profession ? ` specializing in ${profession}` : ''}.
 
 Analyze the uploaded image/document thoroughly and produce a clear, professional, structured report.
 
@@ -71,21 +82,20 @@ Rules:
 - Under 6 total sections
 - Be accurate and objective — no speculation
 - If text is blurry/unreadable, state clearly
-${context ? `\nAdditional user context: ${context}` : ''}`;
+${context ? `\n\nUser context: ${context}` : ''}`;
 
-        const fullPrompt = `${basePrompt}${
-          context ? `\n\nAdditional context from user: ${context}` : ''
-        }`;
+        // Use Vite env variable for API base URL (critical for deployment!)
+        const API_BASE = import.meta.env.VITE_API_URL || '';
 
-        const response = await fetch('/api/analyze', {
+        const response = await fetch(`${API_BASE}/api/analyze`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({
             base64,
-            mimeType: file.type,
-            prompt: fullPrompt,
+            mimeType: file.type || 'application/octet-stream',
+            prompt,
           }),
         });
 
@@ -94,11 +104,9 @@ ${context ? `\nAdditional user context: ${context}` : ''}`;
           throw new Error(errData.error || `Server error: ${response.status}`);
         }
 
-        const data = await response.json();
-        const analysis = data.analysis?.trim();
-
-        if (!analysis) {
-          throw new Error('No analysis returned from server');
+        const { analysis } = await response.json();
+        if (!analysis?.trim()) {
+          throw new Error('Empty analysis received from server');
         }
 
         const newAnalysis: VisionAnalysis = {
@@ -106,7 +114,7 @@ ${context ? `\nAdditional user context: ${context}` : ''}`;
           fileName: file.name,
           mimeType: file.type,
           thumbnail,
-          analysis,
+          analysis: analysis.trim(),
           timestamp: new Date(),
         };
 
@@ -116,6 +124,10 @@ ${context ? `\nAdditional user context: ${context}` : ''}`;
         console.error('Vision analysis error:', err);
         const errorMsg = err instanceof Error ? err.message : 'Analysis failed';
         setError(errorMsg);
+
+        // Clean up thumbnail on error
+        if (thumbnail) URL.revokeObjectURL(thumbnail);
+
         return null;
       } finally {
         setIsAnalyzing(false);
